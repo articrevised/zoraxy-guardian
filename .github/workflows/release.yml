@@ -1,0 +1,97 @@
+name: build-and-release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+      - run: go test ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, ext: '' }
+          - { goos: linux,   goarch: arm64, ext: '' }
+          - { goos: linux,   goarch: arm,   goarm: 7, ext: '' }
+          - { goos: windows, goarch: amd64, ext: '.exe' }
+          - { goos: darwin,  goarch: amd64, ext: '' }
+          - { goos: darwin,  goarch: arm64, ext: '' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+      - name: build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          # Zoraxy distribution naming: <os>_<arch>_<name>[.ext]
+          out="${GOOS}_${GOARCH}_guardian${{ matrix.ext }}"
+          go build -trimpath -ldflags="-s -w" -o "$out" .
+          # Sanity: introspect should still work on host runner only when goos=linux/amd64.
+          if [ "$GOOS" = "linux" ] && [ "$GOARCH" = "amd64" ]; then
+            ./"$out" -introspect | head -1
+          fi
+          ls -la "$out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.goos }}_${{ matrix.goarch }}
+          path: ${{ matrix.goos }}_${{ matrix.goarch }}_guardian*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -la dist/
+
+      # Rolling "latest" release for main-branch pushes.
+      - name: rolling release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Rolling build (${{ github.sha }})"
+          body: |
+            Rolling build from `main` @ ${{ github.sha }}.
+
+            Binaries are named `<os>_<arch>_guardian[.exe]` per Zoraxy's plugin distribution convention.
+            On the Zoraxy host, rename to `guardian` (no prefix) and drop into `plugins/guardian/`.
+          prerelease: true
+          files: dist/*
+          fail_on_unmatched_files: true
+          make_latest: 'false'
+
+      # Tagged release for v* pushes.
+      - name: tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
