@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="csrf-token" content="{{.csrfToken}}">
+<title>Guardian</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Guardian</h1>
+  <span class="subtitle">IP &middot; UA &middot; WAF &middot; Rate limit &middot; Per-host scopes</span>
+  <span id="status" class="status"></span>
+</header>
+
+<nav>
+  <button class="tab active" data-tab="ip">IP rules</button>
+  <button class="tab" data-tab="ua">User agents</button>
+  <button class="tab" data-tab="waf">WAF rules</button>
+  <button class="tab" data-tab="rate">Rate limit</button>
+  <button class="tab" data-tab="general">General</button>
+  <button class="tab" data-tab="log">Block log</button>
+</nav>
+
+<main>
+  <section id="tab-ip" class="tab-panel active">
+    <h2>Allowlist</h2>
+    <p class="hint">If at least one allow rule applies to a host, ONLY listed IPs/ranges are allowed through that host. Leave empty (or scope to other hosts) to disable allowlisting elsewhere.</p>
+    <table class="scoped-table" id="ip-allow-table">
+      <thead><tr><th>IP or CIDR</th><th>Hosts (glob, comma-sep; empty = all)</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <button data-add="ip-allow">Add allow rule</button>
+
+    <h2>Blocklist</h2>
+    <table class="scoped-table" id="ip-block-table">
+      <thead><tr><th>IP or CIDR</th><th>Hosts (glob, comma-sep; empty = all)</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <button data-add="ip-block">Add block rule</button>
+  </section>
+
+  <section id="tab-ua" class="tab-panel">
+    <h2>User-Agent blocklist</h2>
+    <p class="hint">Regex (case-insensitive prefix: <code>(?i)</code>). Matched against the request's <code>User-Agent</code> header.</p>
+    <table class="scoped-table" id="ua-table">
+      <thead><tr><th>Pattern</th><th>Hosts (glob, comma-sep; empty = all)</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <button data-add="ua">Add UA rule</button>
+  </section>
+
+  <section id="tab-waf" class="tab-panel">
+    <h2>WAF rules</h2>
+    <p class="hint">Go regex, matched against request URI, full URL, Cookie, and Referer.</p>
+    <table id="waf-table">
+      <thead><tr><th>On</th><th>Name</th><th>Pattern</th><th>Hosts</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <button id="waf-add">Add rule</button>
+  </section>
+
+  <section id="tab-rate" class="tab-panel">
+    <h2>Per-IP rate limit</h2>
+    <label><input type="checkbox" id="rate-enabled"> Enabled</label>
+    <label>Requests per minute <input type="number" id="rate-rpm" min="1" value="120"></label>
+    <label>Burst <input type="number" id="rate-burst" min="1" value="30"></label>
+    <p class="hint">Limits each source IP globally across all hosts the plugin is assigned to.</p>
+  </section>
+
+  <section id="tab-general" class="tab-panel">
+    <h2>General</h2>
+    <label><input type="checkbox" id="trust-xff"> Trust X-Forwarded-For / X-Real-IP headers</label>
+    <p class="hint">Enable when Guardian is behind Zoraxy (the normal case). Disable only if you don't trust the upstream chain.</p>
+    <h2>Host pattern syntax</h2>
+    <p class="hint">
+      <code>example.com</code> — exact match.<br>
+      <code>*.example.com</code> — single subdomain level (does not match <code>a.b.example.com</code>).<br>
+      <code>**.example.com</code> — any subdomain depth.<br>
+      <code>*</code> or empty — any host.
+    </p>
+  </section>
+
+  <section id="tab-log" class="tab-panel">
+    <h2>Block log <span class="count" id="log-count"></span></h2>
+    <button id="log-refresh">Refresh</button>
+    <table id="log-table">
+      <thead><tr><th>Time</th><th>Src</th><th>IP</th><th>Host</th><th>Method</th><th>URI</th><th>UA</th><th>Reason</th><th>Status</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<footer>
+  <button id="save" class="primary">Save</button>
+  <button id="reload">Reload from disk</button>
+  <span id="save-msg"></span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
