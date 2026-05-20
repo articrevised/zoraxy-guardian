@@ -195,11 +195,12 @@ func TestBlockLogPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	entries := s2.Log()
+	entries := s2.LogPage(0, 0)
 	if len(entries) == 0 {
 		t.Fatalf("expected restored log entries, got 0")
 	}
-	if entries[len(entries)-1].Reason != "ua-blocklist" {
+	// LogPage returns newest-first.
+	if entries[0].Reason != "ua-blocklist" {
 		t.Errorf("last entry reason = %q, want ua-blocklist", entries[len(entries)-1].Reason)
 	}
 }

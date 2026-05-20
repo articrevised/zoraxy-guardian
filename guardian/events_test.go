@@ -41,7 +41,7 @@ func TestEventBlacklistedIPBlocked(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rr.Code)
 	}
-	entries := s.Log()
+	entries := s.LogPage(0, 0)
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 log entry, got %d", len(entries))
 	}

@@ -4,41 +4,86 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	plugin "example.com/guardian/mod/zoraxy_plugin"
 )
 
 // Evaluate applies the rules in order and returns a Decision.
-// Order: blocklist > allowlist > UA > WAF > rate limit. All rules are
-// filtered by host scope first.
+//
+// Order:
+//
+//  1. Temp ban (set by honeypot or auto-ban escalation)
+//  2. IP blocklist
+//  3. Honeypot path match (installs a temp ban as a side-effect)
+//  4. IP allowlist (only enforced on hosts where an allow rule applies)
+//  5. UA blocklist
+//  6. WAF rules
+//  7. Rate limit
+//
+// After any block (other than temp-ban itself, which is already promoted),
+// the IP gets a strike towards auto-ban escalation.
 func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	host := req.Host
-	ip := clientIP(req, s.cfg.TrustXFF)
+	trust := s.cfg.TrustXFF
+	honeypotEnabled := s.cfg.Honeypot.Enabled
+	honeypotBanSecs := s.cfg.Honeypot.BanSeconds
+	allowRules := s.allowRules
+	blockRules := s.blockRules
+	uaRules := s.uaRules
+	wafRules := s.wafRules
+	wafNames := s.wafRuleNames
+	honeypotRules := s.honeypotRules
+	limiter := s.limiter
+	s.mu.RUnlock()
+
+	ip := clientIP(req, trust)
 	parsedIP := net.ParseIP(ip)
 
+	// 1. Temp ban
+	if banned, _ := s.IsTempBanned(ip); banned {
+		return Decision{Block: true, Reason: "temp-ban", Status: http.StatusForbidden}
+	}
+
+	// 2. IP blocklist
 	if parsedIP != nil {
-		for _, r := range s.blockRules {
+		for _, r := range blockRules {
 			if !HostMatches(host, r.Hosts) {
 				continue
 			}
 			if r.Net.Contains(parsedIP) {
-				return Decision{Block: true, Reason: "ip-blocklist", Status: http.StatusForbidden}
+				d := Decision{Block: true, Reason: "ip-blocklist", Status: http.StatusForbidden}
+				s.RecordStrike(ip)
+				return d
 			}
 		}
 	}
 
-	// Allowlist: only enforce if at least one allow rule applies to this host.
-	allowHostScoped := make([]compiledIPRule, 0, len(s.allowRules))
-	for _, r := range s.allowRules {
+	// 3. Honeypot path match — install temp ban as a side-effect
+	if honeypotEnabled {
+		for _, r := range honeypotRules {
+			if !HostMatches(host, r.Hosts) {
+				continue
+			}
+			if r.RE.MatchString(req.RequestURI) {
+				dur := time.Duration(honeypotBanSecs) * time.Second
+				s.AddTempBan(ip, dur)
+				return Decision{Block: true, Reason: "honeypot", Status: http.StatusForbidden}
+			}
+		}
+	}
+
+	// 4. Allowlist (only enforced if at least one allow rule applies to this host)
+	allowHostScoped := make([]compiledIPRule, 0, len(allowRules))
+	for _, r := range allowRules {
 		if HostMatches(host, r.Hosts) {
 			allowHostScoped = append(allowHostScoped, r)
 		}
 	}
 	if len(allowHostScoped) > 0 {
 		if parsedIP == nil {
+			s.RecordStrike(ip)
 			return Decision{Block: true, Reason: "not-allowlisted", Status: http.StatusForbidden}
 		}
 		allowed := false
@@ -49,26 +94,33 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 			}
 		}
 		if !allowed {
+			s.RecordStrike(ip)
 			return Decision{Block: true, Reason: "not-allowlisted", Status: http.StatusForbidden}
 		}
 	}
 
+	// 5. UA blocklist
 	ua := firstHeader(req.Header, "User-Agent")
-	for _, r := range s.uaRules {
+	for _, r := range uaRules {
 		if !HostMatches(host, r.Hosts) {
 			continue
 		}
 		if r.RE.MatchString(ua) {
+			s.RecordStrike(ip)
 			return Decision{Block: true, Reason: "ua-blocklist", Status: http.StatusForbidden}
 		}
 	}
 
-	if hit := s.wafCheckLocked(req, host); hit != "" {
+	// 6. WAF rules
+	if hit := wafCheck(req, host, wafRules, wafNames); hit != "" {
+		s.RecordStrike(ip)
 		return Decision{Block: true, Reason: "waf-" + hit, Status: http.StatusForbidden}
 	}
 
-	if s.limiter != nil && parsedIP != nil {
-		if !s.limiter.allow(parsedIP.String()) {
+	// 7. Rate limit
+	if limiter != nil && parsedIP != nil {
+		if !limiter.allow(parsedIP.String()) {
+			s.RecordStrike(ip)
 			return Decision{Block: true, Reason: "rate-limit", Status: http.StatusTooManyRequests}
 		}
 	}
@@ -76,19 +128,19 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	return Decision{Block: false}
 }
 
-func (s *Store) wafCheckLocked(req *plugin.DynamicSniffForwardRequest, host string) string {
+func wafCheck(req *plugin.DynamicSniffForwardRequest, host string, rules []compiledRegexRule, names []string) string {
 	target := req.RequestURI + " " + req.URL
 	for k, vs := range req.Header {
 		if strings.EqualFold(k, "cookie") || strings.EqualFold(k, "referer") {
 			target += " " + strings.Join(vs, " ")
 		}
 	}
-	for i, r := range s.wafRules {
+	for i, r := range rules {
 		if !HostMatches(host, r.Hosts) {
 			continue
 		}
 		if r.RE.MatchString(target) {
-			return s.wafRuleNames[i]
+			return names[i]
 		}
 	}
 	return ""

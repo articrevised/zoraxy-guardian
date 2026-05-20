@@ -9,15 +9,16 @@ import (
 )
 
 const (
-	maxBlockLog       = 500          // in-memory snapshot cap
-	rotateAtSize      = 5 * 1024 * 1024 // 5 MiB
-	rotateKeepLines   = 2000         // lines kept on rotate
+	maxBlockLog     = 500              // in-memory snapshot cap
+	rotateAtSize    = 5 * 1024 * 1024  // 5 MiB
+	rotateKeepLines = 2000             // lines kept on rotate
 )
 
-// blockLog is an append-only JSONL writer backed by a bounded in-memory ring.
-// On open it tail-reads the file to repopulate the ring so the UI keeps its
-// history across restarts. On size threshold it rotates the file in place by
-// keeping the most recent N lines.
+// blockLog is an append-only JSONL writer backed by a bounded in-memory
+// ring. On open it tail-reads the file to repopulate the ring so the UI
+// keeps its history across restarts. Each Append is fsync'd so a container
+// kill doesn't drop recent entries. On size threshold the file is rotated
+// in place by keeping the most recent N lines.
 type blockLog struct {
 	path string
 	cap  int
@@ -50,8 +51,6 @@ func (bl *blockLog) loadTail() error {
 	}
 	defer f.Close()
 
-	// Streaming read keeps memory bounded even for big files: we keep the
-	// last `cap` parsed entries.
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	ring := make([]BlockLogEntry, 0, bl.cap)
@@ -89,7 +88,12 @@ func (bl *blockLog) Append(entry BlockLogEntry) {
 	}
 	if bl.file != nil {
 		data = append(data, '\n')
-		_, _ = bl.file.Write(data)
+		if _, err := bl.file.Write(data); err == nil {
+			// Best-effort fsync. Block events are infrequent compared to
+			// real traffic, so the cost is negligible and worth it for
+			// crash durability.
+			_ = bl.file.Sync()
+		}
 		bl.rotateIfNeededLocked()
 	}
 }
@@ -113,7 +117,6 @@ func (bl *blockLog) rotateIfNeededLocked() {
 		return
 	}
 
-	// Build new content from the most recent rotateKeepLines entries.
 	start := 0
 	if len(bl.ring) > rotateKeepLines {
 		start = len(bl.ring) - rotateKeepLines
@@ -137,6 +140,11 @@ func (bl *blockLog) rotateIfNeededLocked() {
 		os.Remove(tmp)
 		return
 	}
+	if err := w.Sync(); err != nil {
+		w.Close()
+		os.Remove(tmp)
+		return
+	}
 	if err := w.Close(); err != nil {
 		os.Remove(tmp)
 		return
@@ -144,7 +152,6 @@ func (bl *blockLog) rotateIfNeededLocked() {
 	bl.file.Close()
 	if err := os.Rename(tmp, bl.path); err != nil {
 		os.Remove(tmp)
-		// Try to reopen the original file so we can keep appending.
 		bl.file, _ = os.OpenFile(bl.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		return
 	}

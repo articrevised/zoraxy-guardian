@@ -28,11 +28,14 @@ It plugs into Zoraxy's **dynamic capture** API — your proxy rules carry on as 
 | **IP rules** | Allowlist + blocklist. CIDR (IPv4 + IPv6) and single IPs. |
 | **User-Agent blocklist** | Go regex (use `(?i)` for case-insensitive). |
 | **WAF rules** | Go regex over URI, full URL, Cookie, Referer. 7 default rules. |
-| **Rate limit** | Per-IP token bucket. Configurable rate + burst. Globally across all hosts. |
+| **Rate limit** | Per-IP token bucket with automatic idle bucket eviction. |
+| **Honeypot paths** | Any request to a tripwire URL (e.g. `/.env`, `/wp-login.php`) installs a temp ban on the source IP. |
+| **Auto-ban escalation** | After N strikes in a sliding window, the IP gets a temp ban — escalates noisy scanners from per-rule blocks to a wholesale ban. |
 | **Per-host scopes** | Each rule has an optional host glob filter — `*.api.test`, `**.example.com`, `*`, or exact. |
-| **Block log** | Last 500 events kept in memory; mirrored to JSONL on disk; restored on restart; auto-rotates at 5 MiB. |
+| **Live block log** | Last 500 events kept in memory; mirrored to JSONL on disk with fsync; restored on restart; auto-rotates at 5 MiB. Paginated UI with live SSE updates. |
 | **Zoraxy event subscription** | Mirrors Zoraxy's own `blacklistedIpBlocked` events into Guardian's log. |
 | **XFF awareness** | Respects `X-Forwarded-For`/`X-Real-IP` from Zoraxy by default. Toggle in UI. |
+| **Dark mode** | Light / dark theme toggle, persisted in localStorage; defaults to system preference. |
 | **No external services** | Single ~6 MB Go binary. Embedded UI. No DB, no Redis. |
 
 ---
@@ -110,11 +113,17 @@ Guardian is configured entirely through its web UI (reverse-proxied by Zoraxy at
 | `path-traversal` | `../` and `..\` |
 | `null-byte` | `%00` |
 
-**Rate limit** — Per-IP token bucket. Configure requests/minute and burst.
+**Rate limit** — Per-IP token bucket. Configure requests/minute and burst. Buckets idle for >10 min are swept automatically; the map is hard-capped at 50k entries.
+
+**Honeypot** — A list of "tripwire" URL paths. Any request matching one of them adds the source IP to the temp-ban list for the configured duration. Ships with sensible defaults (`/.env`, `/.git/config`, `/wp-login.php`, `/phpmyadmin/`, etc.) and is OFF by default — turn it on once you've reviewed the path list.
+
+**Auto-ban** — After an IP triggers any block rule `Threshold` times within `Window` seconds, it gets promoted to the temp-ban list for `Ban duration`. Honeypot hits install temp bans directly without strikes.
+
+**Temp bans** — Live list of IPs currently temp-banned, with their expiry timestamps. Per-row "Clear" button to manually revoke.
 
 **General** — Trust-XFF toggle and host pattern reference.
 
-**Block log** — Recent block events with source (`guardian` vs `zoraxy`), reason, status code.
+**Block log** — Recent block events with source (`guardian` vs `zoraxy`), reason, status code. Paginated 50 at a time with a free-text filter. New blocks appear live via Server-Sent Events (the green/red dot in the header reflects connection status).
 
 ### Host pattern syntax
 
@@ -133,13 +142,17 @@ Matching is case-insensitive; port suffixes (`:8443`) are stripped before matchi
 
 For each incoming request:
 
-1. IP blocklist
-2. IP allowlist (only enforced on hosts where an allow rule applies)
-3. User-Agent blocklist
-4. WAF rules
-5. Rate limit
+1. **Temp ban** — IP currently in the auto-expiring ban list
+2. **IP blocklist** — static CIDR/IP block
+3. **Honeypot** — URI matches a tripwire path → installs a temp ban as a side-effect
+4. **IP allowlist** — only enforced on hosts where an allow rule applies
+5. **User-Agent blocklist**
+6. **WAF rules**
+7. **Rate limit**
 
 First match wins. The decision is recorded under the request's UUID; when Zoraxy follows up to deliver the actual request body to Guardian's capture endpoint, Guardian responds with `403` (or `429` for rate-limit) and an `X-Guardian-Reason` header.
+
+Blocks from rules 2 and 4-7 also record a *strike* against the source IP. If the IP accumulates `AutoBan.Threshold` strikes within `AutoBan.WindowSeconds`, it gets promoted to a temp ban.
 
 ---
 
@@ -193,15 +206,16 @@ SKIP_PUSH=1 ./build.sh
 .
 ├── main.go                   ← entrypoint: Introspect spec + handler wiring
 ├── guardian/
-│   ├── state.go              ← Config, Store, persistence
+│   ├── state.go              ← Config, Store, persistence, temp bans, strike tracker
 │   ├── sniff.go              ← rule evaluation pipeline
 │   ├── ingress.go            ← block-response writer
-│   ├── ratelimit.go          ← token bucket per IP
+│   ├── ratelimit.go          ← token bucket per IP, background sweep
 │   ├── host.go               ← glob host matching
-│   ├── blocklog.go           ← bounded JSONL log w/ rotation
+│   ├── blocklog.go           ← bounded JSONL log w/ rotation + fsync
+│   ├── broadcast.go          ← log fan-out for SSE subscribers
 │   ├── events.go             ← Zoraxy event subscription handler
-│   ├── api.go                ← UI-facing HTTP endpoints
-│   └── *_test.go             ← test suite (host, sniff, ratelimit, events)
+│   ├── api.go                ← UI-facing HTTP endpoints (config, log, SSE, tempbans)
+│   └── *_test.go             ← test suite
 ├── mod/zoraxy_plugin/        ← vendored SDK from upstream Zoraxy
 ├── www/                      ← embedded UI (no build step; vanilla HTML/CSS/JS)
 ├── build.sh                  ← local build + push wrapper
@@ -270,4 +284,6 @@ Located next to the binary at `<plugins-dir>/guardian/`:
 
 ## License
 
-The vendored `mod/zoraxy_plugin/` SDK is under LGPL (from upstream Zoraxy). The rest of this project has no license set yet — pick one before publishing widely.
+MIT — see [LICENSE](LICENSE).
+
+The vendored `mod/zoraxy_plugin/` SDK is LGPL (from upstream Zoraxy).

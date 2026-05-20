@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sync"
 	"time"
@@ -25,6 +26,8 @@ type Config struct {
 	UABlocklist []ScopedEntry `json:"ua_blocklist"`
 	WAFRules    []WAFRule     `json:"waf_rules"`
 	RateLimit   RateLimit     `json:"rate_limit"`
+	Honeypot    Honeypot      `json:"honeypot"`
+	AutoBan     AutoBan       `json:"auto_ban"`
 	TrustXFF    bool          `json:"trust_xff"`
 }
 
@@ -39,6 +42,26 @@ type RateLimit struct {
 	Enabled           bool `json:"enabled"`
 	RequestsPerMinute int  `json:"requests_per_minute"`
 	Burst             int  `json:"burst"`
+}
+
+// Honeypot fires before any other rule: any request whose path matches one
+// of the configured glob patterns gets the source IP added to TempBans for
+// BanSeconds. The IP stays blocked even on unrelated paths until the ban
+// expires.
+type Honeypot struct {
+	Enabled    bool          `json:"enabled"`
+	Paths      []ScopedEntry `json:"paths"`
+	BanSeconds int           `json:"ban_seconds"`
+}
+
+// AutoBan tracks how many times an IP has tripped Guardian's rules in a
+// rolling window; if it crosses Threshold in WindowSeconds the IP is added
+// to TempBans for BanSeconds.
+type AutoBan struct {
+	Enabled       bool `json:"enabled"`
+	Threshold     int  `json:"threshold"`
+	WindowSeconds int  `json:"window_seconds"`
+	BanSeconds    int  `json:"ban_seconds"`
 }
 
 type BlockLogEntry struct {
@@ -63,22 +86,35 @@ type compiledRegexRule struct {
 	Hosts []string
 }
 
+// compiledGlobRule is used for honeypot path matching.
+type compiledGlobRule struct {
+	RE    *regexp.Regexp
+	Hosts []string
+}
+
 type Store struct {
 	configPath string
 	logPath    string
 
-	mu           sync.RWMutex
-	cfg          Config
-	allowRules   []compiledIPRule
-	blockRules   []compiledIPRule
-	uaRules      []compiledRegexRule
-	wafRules     []compiledRegexRule
-	wafRuleNames []string
-	limiter      *rateLimiter
-	log          *blockLog
+	mu             sync.RWMutex
+	cfg            Config
+	allowRules     []compiledIPRule
+	blockRules     []compiledIPRule
+	uaRules        []compiledRegexRule
+	wafRules       []compiledRegexRule
+	wafRuleNames   []string
+	honeypotRules  []compiledGlobRule
+	limiter        *rateLimiter
+	log            *blockLog
+	bcast          *broadcaster
 
 	pendingMu sync.Mutex
 	pending   map[string]Decision
+
+	// Temporary bans + strike tracking (separate mutex; hot path).
+	banMu    sync.Mutex
+	tempBans map[string]time.Time   // IP -> expiry
+	strikes  map[string][]time.Time // IP -> recent strike timestamps
 }
 
 type Decision struct {
@@ -92,6 +128,9 @@ func LoadState(configPath, logPath string) (*Store, error) {
 		configPath: configPath,
 		logPath:    logPath,
 		pending:    make(map[string]Decision),
+		tempBans:   make(map[string]time.Time),
+		strikes:    make(map[string][]time.Time),
+		bcast:      newBroadcaster(),
 	}
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -103,6 +142,9 @@ func LoadState(configPath, logPath string) (*Store, error) {
 		if err := json.Unmarshal(data, &s.cfg); err != nil {
 			return nil, err
 		}
+		// Backfill defaults for fields that may be missing from older
+		// config files (Honeypot/AutoBan didn't exist before v0.3).
+		s.cfg = mergeDefaults(s.cfg)
 	}
 	s.compile()
 	log, err := openBlockLog(logPath, maxBlockLog)
@@ -110,22 +152,35 @@ func LoadState(configPath, logPath string) (*Store, error) {
 		return nil, err
 	}
 	s.log = log
+	go s.banSweepLoop()
 	return s, nil
 }
 
 func defaultConfig() Config {
-	return Config{
-		IPAllowlist: []ScopedEntry{},
-		IPBlocklist: []ScopedEntry{},
-		UABlocklist: []ScopedEntry{
+	return mergeDefaults(Config{})
+}
+
+// mergeDefaults fills zero-value fields with sensible defaults. Used both
+// for fresh installs and to upgrade old config files in place.
+func mergeDefaults(c Config) Config {
+	if c.IPAllowlist == nil {
+		c.IPAllowlist = []ScopedEntry{}
+	}
+	if c.IPBlocklist == nil {
+		c.IPBlocklist = []ScopedEntry{}
+	}
+	if c.UABlocklist == nil {
+		c.UABlocklist = []ScopedEntry{
 			{Value: `(?i)sqlmap`},
 			{Value: `(?i)nikto`},
 			{Value: `(?i)nmap`},
 			{Value: `(?i)masscan`},
 			{Value: `(?i)acunetix`},
 			{Value: `(?i)nessus`},
-		},
-		WAFRules: []WAFRule{
+		}
+	}
+	if c.WAFRules == nil {
+		c.WAFRules = []WAFRule{
 			{Name: "sqli-union", Pattern: `(?i)union[\s/*]+select`, Enabled: true},
 			{Name: "sqli-comment", Pattern: `(?i)(--|#|/\*).*(\bor\b|\band\b)`, Enabled: true},
 			{Name: "xss-script", Pattern: `(?i)<script\b`, Enabled: true},
@@ -133,17 +188,50 @@ func defaultConfig() Config {
 			{Name: "xss-onevent", Pattern: `(?i)\bon\w+\s*=`, Enabled: true},
 			{Name: "path-traversal", Pattern: `(\.\./|\.\.\\)`, Enabled: true},
 			{Name: "null-byte", Pattern: `%00`, Enabled: true},
-		},
-		RateLimit: RateLimit{
-			Enabled:           false,
-			RequestsPerMinute: 120,
-			Burst:             30,
-		},
-		TrustXFF: true,
+		}
 	}
+	if c.RateLimit.RequestsPerMinute == 0 {
+		c.RateLimit.RequestsPerMinute = 120
+	}
+	if c.RateLimit.Burst == 0 {
+		c.RateLimit.Burst = 30
+	}
+	if c.Honeypot.Paths == nil {
+		c.Honeypot.Paths = []ScopedEntry{
+			{Value: "/.env"},
+			{Value: "/.git/config"},
+			{Value: "/.git/HEAD"},
+			{Value: "/.aws/credentials"},
+			{Value: "/.ssh/id_rsa"},
+			{Value: "/wp-login.php"},
+			{Value: "/wp-admin/setup-config.php"},
+			{Value: "/phpmyadmin/"},
+			{Value: "/admin/config.php"},
+			{Value: "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php"},
+		}
+	}
+	if c.Honeypot.BanSeconds == 0 {
+		c.Honeypot.BanSeconds = 3600
+	}
+	if c.AutoBan.Threshold == 0 {
+		c.AutoBan.Threshold = 5
+	}
+	if c.AutoBan.WindowSeconds == 0 {
+		c.AutoBan.WindowSeconds = 60
+	}
+	if c.AutoBan.BanSeconds == 0 {
+		c.AutoBan.BanSeconds = 600
+	}
+	return c
 }
 
 func (s *Store) compile() {
+	// Stop the old limiter goroutine before swapping in a new one.
+	if s.limiter != nil {
+		s.limiter.Stop()
+		s.limiter = nil
+	}
+
 	s.allowRules = compileIPRules(s.cfg.IPAllowlist)
 	s.blockRules = compileIPRules(s.cfg.IPBlocklist)
 	s.uaRules = compileRegexRules(s.cfg.UABlocklist)
@@ -162,10 +250,13 @@ func (s *Store) compile() {
 		s.wafRuleNames = append(s.wafRuleNames, r.Name)
 	}
 
+	s.honeypotRules = nil
+	if s.cfg.Honeypot.Enabled {
+		s.honeypotRules = compileGlobRules(s.cfg.Honeypot.Paths)
+	}
+
 	if s.cfg.RateLimit.Enabled {
 		s.limiter = newRateLimiter(s.cfg.RateLimit.RequestsPerMinute, s.cfg.RateLimit.Burst)
-	} else {
-		s.limiter = nil
 	}
 }
 
@@ -201,6 +292,32 @@ func compileRegexRules(entries []ScopedEntry) []compiledRegexRule {
 	return out
 }
 
+// compileGlobRules accepts path patterns: either a literal prefix (matches
+// anywhere in the request URI) or a path containing `*` which is converted
+// to regex (where `*` matches anything except `/`).
+func compileGlobRules(entries []ScopedEntry) []compiledGlobRule {
+	out := make([]compiledGlobRule, 0, len(entries))
+	for _, e := range entries {
+		val := e.Value
+		if val == "" {
+			continue
+		}
+		var re *regexp.Regexp
+		var err error
+		if !regexp.MustCompile(`[*?]`).MatchString(val) {
+			// Plain prefix: match anywhere in the URI as a literal.
+			re = regexp.MustCompile(regexp.QuoteMeta(val))
+		} else {
+			re, err = regexp.Compile(globToRegex(val))
+			if err != nil {
+				continue
+			}
+		}
+		out = append(out, compiledGlobRule{RE: re, Hosts: e.Hosts})
+	}
+	return out
+}
+
 func (s *Store) Snapshot() Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -209,10 +326,12 @@ func (s *Store) Snapshot() Config {
 	cfg.IPBlocklist = append([]ScopedEntry{}, s.cfg.IPBlocklist...)
 	cfg.UABlocklist = append([]ScopedEntry{}, s.cfg.UABlocklist...)
 	cfg.WAFRules = append([]WAFRule{}, s.cfg.WAFRules...)
+	cfg.Honeypot.Paths = append([]ScopedEntry{}, s.cfg.Honeypot.Paths...)
 	return cfg
 }
 
 func (s *Store) Update(cfg Config) error {
+	cfg = mergeDefaults(cfg)
 	s.mu.Lock()
 	s.cfg = cfg
 	s.compile()
@@ -220,6 +339,8 @@ func (s *Store) Update(cfg Config) error {
 	return s.Save()
 }
 
+// Save writes config.json atomically via tmp + rename. Survives a crash
+// mid-write: either the new file is in place or the old one is.
 func (s *Store) Save() error {
 	s.mu.RLock()
 	data, err := json.MarshalIndent(s.cfg, "", "  ")
@@ -227,7 +348,40 @@ func (s *Store) Save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.configPath, data, 0o644)
+	return atomicWriteFile(s.configPath, data, 0o644)
+}
+
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		cleanup()
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		cleanup()
+		return err
+	}
+	return nil
 }
 
 func (s *Store) RecordDecision(uuid string, d Decision) {
@@ -266,6 +420,7 @@ func (s *Store) LogBlock(req *plugin.DynamicSniffForwardRequest, d Decision) {
 		Status:     d.Status,
 	}
 	s.log.Append(entry)
+	s.bcast.publish(entry)
 }
 
 func (s *Store) LogEntry(entry BlockLogEntry) {
@@ -273,8 +428,151 @@ func (s *Store) LogEntry(entry BlockLogEntry) {
 		entry.Time = time.Now().UTC()
 	}
 	s.log.Append(entry)
+	s.bcast.publish(entry)
 }
 
-func (s *Store) Log() []BlockLogEntry {
-	return s.log.Snapshot()
+// LogPage returns blocklog entries newest-first, paginated.
+func (s *Store) LogPage(offset, limit int) []BlockLogEntry {
+	all := s.log.Snapshot()
+	// Reverse: ring is oldest-first; UI wants newest-first.
+	n := len(all)
+	rev := make([]BlockLogEntry, n)
+	for i, e := range all {
+		rev[n-1-i] = e
+	}
+	if offset >= n {
+		return []BlockLogEntry{}
+	}
+	end := offset + limit
+	if limit <= 0 || end > n {
+		end = n
+	}
+	return rev[offset:end]
+}
+
+func (s *Store) LogTotal() int {
+	return len(s.log.Snapshot())
+}
+
+// Broadcaster returns the underlying log broadcaster for SSE subscribers.
+func (s *Store) Broadcaster() *broadcaster { return s.bcast }
+
+// --- temp bans / strike tracking ---
+
+// IsTempBanned returns true if the IP currently has an active temp ban.
+// Lazily purges expired entries on each call.
+func (s *Store) IsTempBanned(ip string) (bool, time.Time) {
+	if ip == "" {
+		return false, time.Time{}
+	}
+	s.banMu.Lock()
+	defer s.banMu.Unlock()
+	exp, ok := s.tempBans[ip]
+	if !ok {
+		return false, time.Time{}
+	}
+	if time.Now().After(exp) {
+		delete(s.tempBans, ip)
+		return false, time.Time{}
+	}
+	return true, exp
+}
+
+// AddTempBan installs or extends a temp ban on ip for the given duration.
+func (s *Store) AddTempBan(ip string, dur time.Duration) {
+	if ip == "" || dur <= 0 {
+		return
+	}
+	expiry := time.Now().Add(dur)
+	s.banMu.Lock()
+	if cur, ok := s.tempBans[ip]; !ok || cur.Before(expiry) {
+		s.tempBans[ip] = expiry
+	}
+	s.banMu.Unlock()
+}
+
+// RecordStrike adds a block strike for ip. If the count of strikes within
+// the configured window crosses Threshold, the IP is added to TempBans and
+// the function returns the resulting ban duration (zero if none).
+func (s *Store) RecordStrike(ip string) time.Duration {
+	if ip == "" {
+		return 0
+	}
+	s.mu.RLock()
+	cfg := s.cfg.AutoBan
+	s.mu.RUnlock()
+	if !cfg.Enabled || cfg.Threshold < 1 {
+		return 0
+	}
+	now := time.Now()
+	cutoff := now.Add(-time.Duration(cfg.WindowSeconds) * time.Second)
+
+	s.banMu.Lock()
+	hist := s.strikes[ip]
+	// Drop strikes outside the window.
+	keep := hist[:0]
+	for _, t := range hist {
+		if t.After(cutoff) {
+			keep = append(keep, t)
+		}
+	}
+	keep = append(keep, now)
+	s.strikes[ip] = keep
+	count := len(keep)
+	s.banMu.Unlock()
+
+	if count >= cfg.Threshold {
+		dur := time.Duration(cfg.BanSeconds) * time.Second
+		s.AddTempBan(ip, dur)
+		// Reset strikes once promoted so re-bans require fresh activity.
+		s.banMu.Lock()
+		delete(s.strikes, ip)
+		s.banMu.Unlock()
+		return dur
+	}
+	return 0
+}
+
+// TempBansSnapshot returns a copy of the current temp-ban map.
+func (s *Store) TempBansSnapshot() map[string]time.Time {
+	s.banMu.Lock()
+	defer s.banMu.Unlock()
+	now := time.Now()
+	out := make(map[string]time.Time, len(s.tempBans))
+	for k, v := range s.tempBans {
+		if v.After(now) {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// ClearTempBan removes an active temp ban.
+func (s *Store) ClearTempBan(ip string) {
+	s.banMu.Lock()
+	delete(s.tempBans, ip)
+	delete(s.strikes, ip)
+	s.banMu.Unlock()
+}
+
+// banSweepLoop periodically removes expired temp bans and old strike
+// records. Cheap; only runs once a minute.
+func (s *Store) banSweepLoop() {
+	t := time.NewTicker(1 * time.Minute)
+	defer t.Stop()
+	for range t.C {
+		now := time.Now()
+		s.banMu.Lock()
+		for ip, exp := range s.tempBans {
+			if now.After(exp) {
+				delete(s.tempBans, ip)
+			}
+		}
+		for ip, hist := range s.strikes {
+			if len(hist) == 0 || now.Sub(hist[len(hist)-1]) > 10*time.Minute {
+				delete(s.strikes, ip)
+			}
+		}
+		s.banMu.Unlock()
+	}
 }

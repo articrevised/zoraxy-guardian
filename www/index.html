@@ -9,7 +9,10 @@
 <body>
 <header>
   <h1>Guardian</h1>
-  <span class="subtitle">IP &middot; UA &middot; WAF &middot; Rate limit &middot; Per-host scopes</span>
+  <span class="subtitle">IP &middot; UA &middot; WAF &middot; Rate limit &middot; Honeypot &middot; Auto-ban</span>
+  <span class="grow"></span>
+  <span id="live" class="live" title="live block-log stream status">●</span>
+  <button id="theme-toggle" class="icon-btn" title="Toggle dark mode" aria-label="Toggle dark mode">🌓</button>
   <span id="status" class="status"></span>
 </header>
 
@@ -18,6 +21,9 @@
   <button class="tab" data-tab="ua">User agents</button>
   <button class="tab" data-tab="waf">WAF rules</button>
   <button class="tab" data-tab="rate">Rate limit</button>
+  <button class="tab" data-tab="honeypot">Honeypot</button>
+  <button class="tab" data-tab="autoban">Auto-ban</button>
+  <button class="tab" data-tab="tempbans">Temp bans</button>
   <button class="tab" data-tab="general">General</button>
   <button class="tab" data-tab="log">Block log</button>
 </nav>
@@ -68,6 +74,36 @@
     <p class="hint">Limits each source IP globally across all hosts the plugin is assigned to.</p>
   </section>
 
+  <section id="tab-honeypot" class="tab-panel">
+    <h2>Honeypot paths</h2>
+    <p class="hint">Any request whose URI matches one of these patterns triggers an immediate temporary ban on the source IP. Use literal paths (e.g. <code>/.env</code>) for prefix-substring matches, or include <code>*</code> for glob patterns. Bots probe these constantly — a perfect signal source.</p>
+    <label><input type="checkbox" id="honeypot-enabled"> Enabled</label>
+    <label>Ban duration (seconds) <input type="number" id="honeypot-ban-secs" min="60" value="3600"></label>
+    <table class="scoped-table" id="honeypot-table">
+      <thead><tr><th>Path</th><th>Hosts (glob, comma-sep; empty = all)</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <button data-add="honeypot">Add honeypot path</button>
+  </section>
+
+  <section id="tab-autoban" class="tab-panel">
+    <h2>Auto-ban escalation</h2>
+    <p class="hint">After an IP triggers any block rule (UA, WAF, rate-limit, etc.) <code>Threshold</code> times within <code>Window</code> seconds, it's added to the temp-ban list for <code>Ban duration</code>. Honeypot hits already install temp bans directly.</p>
+    <label><input type="checkbox" id="autoban-enabled"> Enabled</label>
+    <label>Threshold (strikes) <input type="number" id="autoban-threshold" min="1" value="5"></label>
+    <label>Window (seconds) <input type="number" id="autoban-window" min="1" value="60"></label>
+    <label>Ban duration (seconds) <input type="number" id="autoban-ban-secs" min="60" value="600"></label>
+  </section>
+
+  <section id="tab-tempbans" class="tab-panel">
+    <h2>Active temp bans <span class="count" id="tempbans-count"></span></h2>
+    <button id="tempbans-refresh">Refresh</button>
+    <table id="tempbans-table">
+      <thead><tr><th>IP</th><th>Expires</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
   <section id="tab-general" class="tab-panel">
     <h2>General</h2>
     <label><input type="checkbox" id="trust-xff"> Trust X-Forwarded-For / X-Real-IP headers</label>
@@ -83,11 +119,18 @@
 
   <section id="tab-log" class="tab-panel">
     <h2>Block log <span class="count" id="log-count"></span></h2>
-    <button id="log-refresh">Refresh</button>
+    <div class="log-controls">
+      <input type="text" id="log-filter" placeholder="Filter (IP, host, reason, UA)…" />
+      <button id="log-refresh">Refresh</button>
+    </div>
     <table id="log-table">
       <thead><tr><th>Time</th><th>Src</th><th>IP</th><th>Host</th><th>Method</th><th>URI</th><th>UA</th><th>Reason</th><th>Status</th></tr></thead>
       <tbody></tbody>
     </table>
+    <div class="pager">
+      <button id="log-older" disabled>Load older</button>
+      <span id="log-pager-info"></span>
+    </div>
   </section>
 </main>
 
