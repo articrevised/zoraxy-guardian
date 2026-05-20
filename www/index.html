@@ -24,6 +24,8 @@
   <button class="tab" data-tab="honeypot">Honeypot</button>
   <button class="tab" data-tab="autoban">Auto-ban</button>
   <button class="tab" data-tab="tempbans">Temp bans</button>
+  <button class="tab" data-tab="hostblock">Host block</button>
+  <button class="tab" data-tab="import">Import CF</button>
   <button class="tab" data-tab="general">General</button>
   <button class="tab" data-tab="log">Block log</button>
 </nav>
@@ -48,9 +50,9 @@
 
   <section id="tab-ua" class="tab-panel">
     <h2>User-Agent blocklist</h2>
-    <p class="hint">Regex (case-insensitive prefix: <code>(?i)</code>). Matched against the request's <code>User-Agent</code> header.</p>
-    <table class="scoped-table" id="ua-table">
-      <thead><tr><th>Pattern</th><th>Hosts (glob, comma-sep; empty = all)</th><th></th></tr></thead>
+    <p class="hint">Regex (case-insensitive prefix: <code>(?i)</code>). Matched against the request's <code>User-Agent</code> header. <strong>Except paths</strong> (comma-sep substrings) skip the rule when the request URI contains any of them — useful for letting bots fetch <code>/robots.txt</code> while blocking everything else.</p>
+    <table class="scoped-table ua-table" id="ua-table">
+      <thead><tr><th>Pattern</th><th>Hosts</th><th>Except paths</th><th></th></tr></thead>
       <tbody></tbody>
     </table>
     <button data-add="ua">Add UA rule</button>
@@ -93,6 +95,31 @@
     <label>Threshold (strikes) <input type="number" id="autoban-threshold" min="1" value="5"></label>
     <label>Window (seconds) <input type="number" id="autoban-window" min="1" value="60"></label>
     <label>Ban duration (seconds) <input type="number" id="autoban-ban-secs" min="60" value="600"></label>
+  </section>
+
+  <section id="tab-hostblock" class="tab-panel">
+    <h2>Host header blocklist</h2>
+    <p class="hint">Regex matched against the request's <code>Host</code> header. Useful for rejecting traffic where someone is probing your Zoraxy IP with a bogus host (e.g. <code>Host: localhost</code>).</p>
+    <table class="scoped-table" id="hostblock-table">
+      <thead><tr><th>Regex</th><th>Hosts (apply scope; usually leave empty)</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <button data-add="hostblock">Add host rule</button>
+  </section>
+
+  <section id="tab-import" class="tab-panel">
+    <h2>Import Cloudflare rule</h2>
+    <p class="hint">Paste a Cloudflare WAF / Custom Rule expression. Guardian translates the predicates it understands into honeypot paths, UA rules, host-header blocks, and WAF rules. Anything it can't translate (e.g. <code>cf.threat_score</code>, GeoIP, TLS fingerprints) is listed as a warning. Click <strong>Preview</strong> first, then <strong>Apply</strong> to merge into your live config.</p>
+    <textarea id="import-cf-input" rows="10" placeholder='e.g. (http.request.uri.path contains "/.env") or (http.user_agent contains "Googlebot")'></textarea>
+    <div style="display:flex;gap:8px;margin-top:8px;">
+      <button id="import-cf-preview">Preview</button>
+      <button id="import-cf-apply" class="primary">Apply &amp; merge</button>
+      <span id="import-cf-msg"></span>
+    </div>
+    <div id="import-cf-preview-output" style="margin-top:12px;display:none;">
+      <h2>Preview</h2>
+      <pre id="import-cf-preview-pre" class="json-preview"></pre>
+    </div>
   </section>
 
   <section id="tab-tempbans" class="tab-panel">

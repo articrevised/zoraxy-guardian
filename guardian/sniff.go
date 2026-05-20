@@ -15,11 +15,12 @@ import (
 //
 //  1. Temp ban (set by honeypot or auto-ban escalation)
 //  2. IP blocklist
-//  3. Honeypot path match (installs a temp ban as a side-effect)
-//  4. IP allowlist (only enforced on hosts where an allow rule applies)
-//  5. UA blocklist
-//  6. WAF rules
-//  7. Rate limit
+//  3. Host-header blocklist
+//  4. Honeypot path match (installs a temp ban as a side-effect)
+//  5. IP allowlist (only enforced on hosts where an allow rule applies)
+//  6. UA blocklist (with optional ExceptPaths)
+//  7. WAF rules
+//  8. Rate limit
 //
 // After any block (other than temp-ban itself, which is already promoted),
 // the IP gets a strike towards auto-ban escalation.
@@ -32,6 +33,7 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	allowRules := s.allowRules
 	blockRules := s.blockRules
 	uaRules := s.uaRules
+	hostBlockRules := s.hostBlockRules
 	wafRules := s.wafRules
 	wafNames := s.wafRuleNames
 	honeypotRules := s.honeypotRules
@@ -53,14 +55,24 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 				continue
 			}
 			if r.Net.Contains(parsedIP) {
-				d := Decision{Block: true, Reason: "ip-blocklist", Status: http.StatusForbidden}
 				s.RecordStrike(ip)
-				return d
+				return Decision{Block: true, Reason: "ip-blocklist", Status: http.StatusForbidden}
 			}
 		}
 	}
 
-	// 3. Honeypot path match — install temp ban as a side-effect
+	// 3. Host-header blocklist
+	for _, r := range hostBlockRules {
+		if !HostMatches(host, r.Hosts) {
+			continue
+		}
+		if r.RE.MatchString(host) {
+			s.RecordStrike(ip)
+			return Decision{Block: true, Reason: "host-blocklist", Status: http.StatusForbidden}
+		}
+	}
+
+	// 4. Honeypot path match — install temp ban as a side-effect
 	if honeypotEnabled {
 		for _, r := range honeypotRules {
 			if !HostMatches(host, r.Hosts) {
@@ -74,7 +86,7 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 		}
 	}
 
-	// 4. Allowlist (only enforced if at least one allow rule applies to this host)
+	// 5. Allowlist (only enforced if at least one allow rule applies to this host)
 	allowHostScoped := make([]compiledIPRule, 0, len(allowRules))
 	for _, r := range allowRules {
 		if HostMatches(host, r.Hosts) {
@@ -99,10 +111,13 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 		}
 	}
 
-	// 5. UA blocklist
+	// 6. UA blocklist (with ExceptPaths)
 	ua := firstHeader(req.Header, "User-Agent")
 	for _, r := range uaRules {
 		if !HostMatches(host, r.Hosts) {
+			continue
+		}
+		if pathExempt(req.RequestURI, r.ExceptPaths) {
 			continue
 		}
 		if r.RE.MatchString(ua) {
@@ -111,13 +126,13 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 		}
 	}
 
-	// 6. WAF rules
+	// 7. WAF rules
 	if hit := wafCheck(req, host, wafRules, wafNames); hit != "" {
 		s.RecordStrike(ip)
 		return Decision{Block: true, Reason: "waf-" + hit, Status: http.StatusForbidden}
 	}
 
-	// 7. Rate limit
+	// 8. Rate limit
 	if limiter != nil && parsedIP != nil {
 		if !limiter.allow(parsedIP.String()) {
 			s.RecordStrike(ip)
@@ -126,6 +141,25 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	}
 
 	return Decision{Block: false}
+}
+
+// pathExempt returns true if requestURI contains any of the literal except
+// paths as a substring. Used by UA rules to skip when the request is going
+// to (say) /robots.txt.
+func pathExempt(requestURI string, exceptPaths []string) bool {
+	if len(exceptPaths) == 0 {
+		return false
+	}
+	uri := strings.ToLower(requestURI)
+	for _, p := range exceptPaths {
+		if p == "" {
+			continue
+		}
+		if strings.Contains(uri, strings.ToLower(p)) {
+			return true
+		}
+	}
+	return false
 }
 
 func wafCheck(req *plugin.DynamicSniffForwardRequest, host string, rules []compiledRegexRule, names []string) string {

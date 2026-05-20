@@ -37,14 +37,20 @@
     return out.length ? out : undefined;
   };
 
-  function renderScopedTable(tableId, entries) {
+  function renderScopedTable(tableId, entries, opts) {
+    opts = opts || {};
     const tbody = $('#' + tableId + ' tbody');
     tbody.innerHTML = '';
     (entries || []).forEach((entry, idx) => {
       const tr = document.createElement('tr');
+      let extra = '';
+      if (opts.exceptPaths) {
+        extra = `<td><input type="text" data-idx="${idx}" data-field="except_paths" value="${esc(hostsToStr(entry.except_paths))}" placeholder="/robots.txt, /favicon.ico"></td>`;
+      }
       tr.innerHTML = `
         <td><input type="text" data-idx="${idx}" data-field="value" value="${esc(entry.value)}"></td>
         <td><input type="text" data-idx="${idx}" data-field="hosts" value="${esc(hostsToStr(entry.hosts))}" placeholder="*"></td>
+        ${extra}
         <td><button class="row-del" data-idx="${idx}" title="Delete">&times;</button></td>`;
       tbody.appendChild(tr);
     });
@@ -56,7 +62,13 @@
     rows.forEach((tr) => {
       const value = tr.querySelector('[data-field="value"]').value.trim();
       const hosts = strToHosts(tr.querySelector('[data-field="hosts"]').value);
-      if (value) out.push(hosts ? { value, hosts } : { value });
+      const exceptEl = tr.querySelector('[data-field="except_paths"]');
+      const except = exceptEl ? strToHosts(exceptEl.value) : undefined;
+      if (!value) return;
+      const entry = { value };
+      if (hosts) entry.hosts = hosts;
+      if (except) entry.except_paths = except;
+      out.push(entry);
     });
     return out;
   }
@@ -80,7 +92,8 @@
     cfg = c;
     renderScopedTable('ip-allow-table', c.ip_allowlist);
     renderScopedTable('ip-block-table', c.ip_blocklist);
-    renderScopedTable('ua-table', c.ua_blocklist);
+    renderScopedTable('ua-table', c.ua_blocklist, { exceptPaths: true });
+    renderScopedTable('hostblock-table', c.host_blocklist || []);
     renderWAF();
     $('#rate-enabled').checked = !!c.rate_limit?.enabled;
     $('#rate-rpm').value = c.rate_limit?.requests_per_minute ?? 120;
@@ -111,6 +124,7 @@
       ip_allowlist: readScopedTable('ip-allow-table'),
       ip_blocklist: readScopedTable('ip-block-table'),
       ua_blocklist: readScopedTable('ua-table'),
+      host_blocklist: readScopedTable('hostblock-table'),
       waf_rules: wafRules,
       rate_limit: {
         enabled: $('#rate-enabled').checked,
@@ -260,7 +274,8 @@
     const add = e.target.dataset.add;
     if (add === 'ip-allow') { (cfg.ip_allowlist ||= []).push({ value: '' }); renderScopedTable('ip-allow-table', cfg.ip_allowlist); }
     else if (add === 'ip-block') { (cfg.ip_blocklist ||= []).push({ value: '' }); renderScopedTable('ip-block-table', cfg.ip_blocklist); }
-    else if (add === 'ua') { (cfg.ua_blocklist ||= []).push({ value: '' }); renderScopedTable('ua-table', cfg.ua_blocklist); }
+    else if (add === 'ua') { (cfg.ua_blocklist ||= []).push({ value: '' }); renderScopedTable('ua-table', cfg.ua_blocklist, { exceptPaths: true }); }
+    else if (add === 'hostblock') { (cfg.host_blocklist ||= []).push({ value: '' }); renderScopedTable('hostblock-table', cfg.host_blocklist); }
     else if (add === 'honeypot') {
       cfg.honeypot = cfg.honeypot || { enabled: false, ban_seconds: 3600, paths: [] };
       cfg.honeypot.paths = cfg.honeypot.paths || [];
@@ -292,6 +307,48 @@
   $('#log-older').addEventListener('click', () => fetchLogPage(true));
   $('#log-filter').addEventListener('input', (e) => { logState.filter = e.target.value; renderLog(); });
   $('#tempbans-refresh').addEventListener('click', fetchTempBans);
+
+  // ---------- Cloudflare import ----------
+  async function importCF(apply) {
+    const expression = $('#import-cf-input').value.trim();
+    const msg = $('#import-cf-msg');
+    msg.className = '';
+    msg.textContent = '';
+    if (!expression) {
+      msg.textContent = 'paste an expression first';
+      msg.className = 'err';
+      return;
+    }
+    const r = await fetch('./api/import/cf', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+      body: JSON.stringify({ expression, apply }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      msg.textContent = data.error || ('error ' + r.status);
+      msg.className = 'err';
+      return;
+    }
+    if (apply) {
+      const s = data.applied || {};
+      const total = (s.honeypot || 0) + (s.ua_blocklist || 0) + (s.host_blocklist || 0) + (s.waf_rules || 0) + (s.ip_blocklist || 0);
+      msg.textContent = `applied: +${s.honeypot || 0} honeypot, +${s.ua_blocklist || 0} UA, +${s.host_blocklist || 0} host, +${s.waf_rules || 0} WAF, +${s.ip_blocklist || 0} IP (${total} new)`;
+      msg.className = 'ok';
+      $('#import-cf-preview-output').style.display = 'block';
+      $('#import-cf-preview-pre').textContent = JSON.stringify(data, null, 2);
+      // Refresh config view so the user sees the new rules.
+      fetchConfig();
+    } else {
+      $('#import-cf-preview-output').style.display = 'block';
+      $('#import-cf-preview-pre').textContent = JSON.stringify(data.preview, null, 2);
+      const p = data.preview || {};
+      msg.textContent = `preview: ${p.honeypot_paths?.length || 0} honeypot, ${p.ua_blocklist?.length || 0} UA, ${p.host_blocklist?.length || 0} host, ${p.waf_rules?.length || 0} WAF, ${p.ip_blocklist?.length || 0} IP, ${p.warnings?.length || 0} warnings`;
+      msg.className = 'ok';
+    }
+  }
+  $('#import-cf-preview').addEventListener('click', () => importCF(false));
+  $('#import-cf-apply').addEventListener('click', () => importCF(true));
 
   fetchConfig();
   connectLogStream();

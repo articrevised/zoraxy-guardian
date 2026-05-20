@@ -22,6 +22,7 @@ func (a *API) RegisterRoutes(ui *plugin.PluginUiRouter, mux *http.ServeMux) {
 	ui.HandleFunc("/api/blocklog/stream", a.handleBlockLogStream, mux)
 	ui.HandleFunc("/api/tempbans", a.handleTempBans, mux)
 	ui.HandleFunc("/api/tempbans/clear", a.handleTempBansClear, mux)
+	ui.HandleFunc("/api/import/cf", a.handleImportCF, mux)
 }
 
 func (a *API) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -137,6 +138,47 @@ func (a *API) handleTempBansClear(w http.ResponseWriter, r *http.Request) {
 	}
 	a.store.ClearTempBan(ip)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cleared", "ip": ip})
+}
+
+// handleImportCF parses a Cloudflare expression and either returns a preview
+// of what would be imported (apply=false) or merges into the live config
+// (apply=true).
+func (a *API) handleImportCF(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Expression string `json:"expression"`
+		Apply      bool   `json:"apply"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	parsed, err := ParseCloudflareRules(body.Expression)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": err.Error(),
+		})
+		return
+	}
+	if !body.Apply {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"preview": parsed,
+		})
+		return
+	}
+	cfg := a.store.Snapshot()
+	stats := MergeCFResult(&cfg, parsed)
+	if err := a.store.Update(cfg); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"applied":  stats,
+		"warnings": parsed.Warnings,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

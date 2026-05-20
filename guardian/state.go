@@ -15,20 +15,26 @@ import (
 // ScopedEntry pairs a rule value (IP/CIDR or regex) with an optional set of
 // host glob patterns. An empty Hosts slice means the entry applies to all
 // hosts proxied through this plugin.
+//
+// ExceptPaths is only honored for UA blocklist entries: if the request path
+// substring-matches any entry in ExceptPaths the UA rule is skipped (e.g.
+// allow /robots.txt even when blocking a bot's UA).
 type ScopedEntry struct {
-	Value string   `json:"value"`
-	Hosts []string `json:"hosts,omitempty"`
+	Value       string   `json:"value"`
+	Hosts       []string `json:"hosts,omitempty"`
+	ExceptPaths []string `json:"except_paths,omitempty"`
 }
 
 type Config struct {
-	IPAllowlist []ScopedEntry `json:"ip_allowlist"`
-	IPBlocklist []ScopedEntry `json:"ip_blocklist"`
-	UABlocklist []ScopedEntry `json:"ua_blocklist"`
-	WAFRules    []WAFRule     `json:"waf_rules"`
-	RateLimit   RateLimit     `json:"rate_limit"`
-	Honeypot    Honeypot      `json:"honeypot"`
-	AutoBan     AutoBan       `json:"auto_ban"`
-	TrustXFF    bool          `json:"trust_xff"`
+	IPAllowlist   []ScopedEntry `json:"ip_allowlist"`
+	IPBlocklist   []ScopedEntry `json:"ip_blocklist"`
+	UABlocklist   []ScopedEntry `json:"ua_blocklist"`
+	HostBlocklist []ScopedEntry `json:"host_blocklist"`
+	WAFRules      []WAFRule     `json:"waf_rules"`
+	RateLimit     RateLimit     `json:"rate_limit"`
+	Honeypot      Honeypot      `json:"honeypot"`
+	AutoBan       AutoBan       `json:"auto_ban"`
+	TrustXFF      bool          `json:"trust_xff"`
 }
 
 type WAFRule struct {
@@ -92,21 +98,30 @@ type compiledGlobRule struct {
 	Hosts []string
 }
 
+// compiledUARule extends a regex rule with optional ExceptPaths: literal
+// substring path tokens that exempt a request from this rule.
+type compiledUARule struct {
+	RE          *regexp.Regexp
+	Hosts       []string
+	ExceptPaths []string
+}
+
 type Store struct {
 	configPath string
 	logPath    string
 
-	mu             sync.RWMutex
-	cfg            Config
-	allowRules     []compiledIPRule
-	blockRules     []compiledIPRule
-	uaRules        []compiledRegexRule
-	wafRules       []compiledRegexRule
-	wafRuleNames   []string
-	honeypotRules  []compiledGlobRule
-	limiter        *rateLimiter
-	log            *blockLog
-	bcast          *broadcaster
+	mu              sync.RWMutex
+	cfg             Config
+	allowRules      []compiledIPRule
+	blockRules      []compiledIPRule
+	uaRules         []compiledUARule
+	hostBlockRules  []compiledRegexRule
+	wafRules        []compiledRegexRule
+	wafRuleNames    []string
+	honeypotRules   []compiledGlobRule
+	limiter         *rateLimiter
+	log             *blockLog
+	bcast           *broadcaster
 
 	pendingMu sync.Mutex
 	pending   map[string]Decision
@@ -168,6 +183,9 @@ func mergeDefaults(c Config) Config {
 	}
 	if c.IPBlocklist == nil {
 		c.IPBlocklist = []ScopedEntry{}
+	}
+	if c.HostBlocklist == nil {
+		c.HostBlocklist = []ScopedEntry{}
 	}
 	if c.UABlocklist == nil {
 		c.UABlocklist = []ScopedEntry{
@@ -234,7 +252,8 @@ func (s *Store) compile() {
 
 	s.allowRules = compileIPRules(s.cfg.IPAllowlist)
 	s.blockRules = compileIPRules(s.cfg.IPBlocklist)
-	s.uaRules = compileRegexRules(s.cfg.UABlocklist)
+	s.uaRules = compileUARules(s.cfg.UABlocklist)
+	s.hostBlockRules = compileRegexRules(s.cfg.HostBlocklist)
 
 	s.wafRules = make([]compiledRegexRule, 0, len(s.cfg.WAFRules))
 	s.wafRuleNames = make([]string, 0, len(s.cfg.WAFRules))
@@ -292,6 +311,18 @@ func compileRegexRules(entries []ScopedEntry) []compiledRegexRule {
 	return out
 }
 
+func compileUARules(entries []ScopedEntry) []compiledUARule {
+	out := make([]compiledUARule, 0, len(entries))
+	for _, e := range entries {
+		re, err := regexp.Compile(e.Value)
+		if err != nil {
+			continue
+		}
+		out = append(out, compiledUARule{RE: re, Hosts: e.Hosts, ExceptPaths: e.ExceptPaths})
+	}
+	return out
+}
+
 // compileGlobRules accepts path patterns: either a literal prefix (matches
 // anywhere in the request URI) or a path containing `*` which is converted
 // to regex (where `*` matches anything except `/`).
@@ -325,6 +356,7 @@ func (s *Store) Snapshot() Config {
 	cfg.IPAllowlist = append([]ScopedEntry{}, s.cfg.IPAllowlist...)
 	cfg.IPBlocklist = append([]ScopedEntry{}, s.cfg.IPBlocklist...)
 	cfg.UABlocklist = append([]ScopedEntry{}, s.cfg.UABlocklist...)
+	cfg.HostBlocklist = append([]ScopedEntry{}, s.cfg.HostBlocklist...)
 	cfg.WAFRules = append([]WAFRule{}, s.cfg.WAFRules...)
 	cfg.Honeypot.Paths = append([]ScopedEntry{}, s.cfg.Honeypot.Paths...)
 	return cfg

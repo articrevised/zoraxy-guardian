@@ -168,7 +168,26 @@ footer {
 
 .scoped-table { margin-bottom: 8px; }
 .scoped-table td:first-child { width: 40%; }
+.scoped-table.ua-table td:first-child { width: 35%; }
+.scoped-table.ua-table td { width: auto; }
 .scoped-table td input { font-family: ui-monospace, monospace; font-size: 12px; }
+
+.json-preview {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px;
+  font-size: 12px;
+  max-height: 400px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text);
+}
+#import-cf-input { font-family: ui-monospace, monospace; font-size: 12px; }
+#import-cf-msg { font-size: 12px; color: var(--text-muted); align-self: center; }
+#import-cf-msg.ok { color: var(--ok); }
+#import-cf-msg.err { color: var(--err); }
 
 .src {
   display: inline-block;

@@ -30,6 +30,9 @@ It plugs into Zoraxy's **dynamic capture** API — your proxy rules carry on as 
 | **WAF rules** | Go regex over URI, full URL, Cookie, Referer. 7 default rules. |
 | **Rate limit** | Per-IP token bucket with automatic idle bucket eviction. |
 | **Honeypot paths** | Any request to a tripwire URL (e.g. `/.env`, `/wp-login.php`) installs a temp ban on the source IP. |
+| **Host-header blocklist** | Block by regex against the request's `Host` header — useful for rejecting probes that arrive with `Host: localhost` etc. |
+| **UA path exceptions** | UA rules can carry an `except_paths` list — e.g. block Googlebot except on `/robots.txt`. |
+| **Cloudflare rule import** | Paste a Cloudflare WAF / Custom Rule expression and Guardian translates it into the right primitives. Handles path/query/UA/host predicates with AND/OR/NOT, multi-clause expressions, and the `path ne X and (...)` exemption pattern. |
 | **Auto-ban escalation** | After N strikes in a sliding window, the IP gets a temp ban — escalates noisy scanners from per-rule blocks to a wholesale ban. |
 | **Per-host scopes** | Each rule has an optional host glob filter — `*.api.test`, `**.example.com`, `*`, or exact. |
 | **Live block log** | Last 500 events kept in memory; mirrored to JSONL on disk with fsync; restored on restart; auto-rotates at 5 MiB. Paginated UI with live SSE updates. |
@@ -121,6 +124,22 @@ Guardian is configured entirely through its web UI (reverse-proxied by Zoraxy at
 
 **Temp bans** — Live list of IPs currently temp-banned, with their expiry timestamps. Per-row "Clear" button to manually revoke.
 
+**Host block** — Regex blocklist matched against the request's `Host` header. Patterns are evaluated after the IP blocklist and before honeypots. Common use: block scans probing your origin IP with `Host: localhost`, `Host: example.invalid`, etc.
+
+**Import CF** — Paste a Cloudflare expression (e.g. from the CF dashboard) and translate it to Guardian primitives. Click **Preview** to see what would be added; click **Apply & merge** to commit. Supported predicates:
+
+| Cloudflare field | Operator | Translates to |
+|---|---|---|
+| `http.request.uri.path` | `contains` | Honeypot path |
+| `http.request.uri.path` | `matches` | WAF rule |
+| `http.request.uri.path` | `ne` *(inside AND)* | UA rule `except_paths` |
+| `http.request.uri.query` | `contains` | WAF rule (case-insensitive) |
+| `http.user_agent` | `contains`, `matches` | UA blocklist entry |
+| `http.host` | `contains`, `eq` | Host blocklist |
+| `ip.src` | `in {…}` | IP blocklist |
+
+Anything else (e.g. `cf.threat_score`, `ip.geoip.country`, `ssl`, method/header subfields) is reported as a warning rather than translated.
+
 **General** — Trust-XFF toggle and host pattern reference.
 
 **Block log** — Recent block events with source (`guardian` vs `zoraxy`), reason, status code. Paginated 50 at a time with a free-text filter. New blocks appear live via Server-Sent Events (the green/red dot in the header reflects connection status).
@@ -144,15 +163,16 @@ For each incoming request:
 
 1. **Temp ban** — IP currently in the auto-expiring ban list
 2. **IP blocklist** — static CIDR/IP block
-3. **Honeypot** — URI matches a tripwire path → installs a temp ban as a side-effect
-4. **IP allowlist** — only enforced on hosts where an allow rule applies
-5. **User-Agent blocklist**
-6. **WAF rules**
-7. **Rate limit**
+3. **Host blocklist** — regex on the `Host` header
+4. **Honeypot** — URI matches a tripwire path → installs a temp ban as a side-effect
+5. **IP allowlist** — only enforced on hosts where an allow rule applies
+6. **User-Agent blocklist** (with optional path exceptions)
+7. **WAF rules**
+8. **Rate limit**
 
 First match wins. The decision is recorded under the request's UUID; when Zoraxy follows up to deliver the actual request body to Guardian's capture endpoint, Guardian responds with `403` (or `429` for rate-limit) and an `X-Guardian-Reason` header.
 
-Blocks from rules 2 and 4-7 also record a *strike* against the source IP. If the IP accumulates `AutoBan.Threshold` strikes within `AutoBan.WindowSeconds`, it gets promoted to a temp ban.
+Blocks from rules 2 and 5-8 also record a *strike* against the source IP. If the IP accumulates `AutoBan.Threshold` strikes within `AutoBan.WindowSeconds`, it gets promoted to a temp ban.
 
 ---
 
@@ -213,6 +233,7 @@ SKIP_PUSH=1 ./build.sh
 │   ├── host.go               ← glob host matching
 │   ├── blocklog.go           ← bounded JSONL log w/ rotation + fsync
 │   ├── broadcast.go          ← log fan-out for SSE subscribers
+│   ├── cfparse.go            ← Cloudflare expression parser + translator
 │   ├── events.go             ← Zoraxy event subscription handler
 │   ├── api.go                ← UI-facing HTTP endpoints (config, log, SSE, tempbans)
 │   └── *_test.go             ← test suite
