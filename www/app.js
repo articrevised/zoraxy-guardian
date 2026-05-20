@@ -98,7 +98,7 @@
 
   async function fetchConfig() {
     setStatus('Loading…');
-    const r = await fetch('./api/config', { headers: { 'X-Zoraxy-Csrf': csrfToken } });
+    const r = await fetch('./api/config', { headers: { 'X-CSRF-Token': csrfToken } });
     if (!r.ok) { setStatus('Load failed', true); return; }
     applyToUI(await r.json());
     setStatus('Loaded');
@@ -109,7 +109,7 @@
     setStatus('Saving…');
     const r = await fetch('./api/config', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Zoraxy-Csrf': csrfToken },
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
       body: JSON.stringify(body),
     });
     if (!r.ok) { setStatus('Save failed: ' + r.status, true); return; }
@@ -119,7 +119,7 @@
   }
 
   async function fetchLog() {
-    const r = await fetch('./api/blocklog', { headers: { 'X-Zoraxy-Csrf': csrfToken } });
+    const r = await fetch('./api/blocklog', { headers: { 'X-CSRF-Token': csrfToken } });
     if (!r.ok) return;
     const entries = await r.json();
     const tbody = $('#log-table tbody');
