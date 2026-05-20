@@ -1,12 +1,15 @@
-# Build artifacts
-/guardian
-/guardian-plugin
+# Local build artifact (the Go package directory is NOT ignored;
+# the binary lives at the repo root and is named differently)
 /zoraxy-guardian
+/guardian-plugin
 
 # Runtime state (created when the plugin runs)
 /config.json
 /blocklog.jsonl
 /state.json
+
+# Local Claude Code settings (per-machine)
+/.claude/
 
 # Editor / OS noise
 .DS_Store
