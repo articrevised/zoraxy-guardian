@@ -105,6 +105,10 @@
     $('#autoban-threshold').value = c.auto_ban?.threshold ?? 5;
     $('#autoban-window').value = c.auto_ban?.window_seconds ?? 60;
     $('#autoban-ban-secs').value = c.auto_ban?.ban_seconds ?? 600;
+    $('#fingerprint-enabled').checked = !!c.fingerprint_tracking?.enabled;
+    $('#fingerprint-threshold').value = c.fingerprint_tracking?.threshold ?? 10;
+    $('#fingerprint-window').value = c.fingerprint_tracking?.window_seconds ?? 300;
+    $('#fingerprint-ban-secs').value = c.fingerprint_tracking?.ban_seconds ?? 3600;
     $('#trust-xff').checked = !!c.trust_xff;
   }
 
@@ -141,6 +145,12 @@
         threshold: parseInt($('#autoban-threshold').value, 10) || 5,
         window_seconds: parseInt($('#autoban-window').value, 10) || 60,
         ban_seconds: parseInt($('#autoban-ban-secs').value, 10) || 600,
+      },
+      fingerprint_tracking: {
+        enabled: $('#fingerprint-enabled').checked,
+        threshold: parseInt($('#fingerprint-threshold').value, 10) || 10,
+        window_seconds: parseInt($('#fingerprint-window').value, 10) || 300,
+        ban_seconds: parseInt($('#fingerprint-ban-secs').value, 10) || 3600,
       },
       trust_xff: $('#trust-xff').checked,
     };
@@ -260,6 +270,30 @@
     fetchTempBans();
   }
 
+  // ---------- fingerprint bans ----------
+  async function fetchFingerprintBans() {
+    const r = await fetch('./api/fingerprintbans', { headers: { 'X-CSRF-Token': csrfToken } });
+    if (!r.ok) return;
+    const bans = await r.json();
+    const tbody = $('#fingerprintban-table tbody');
+    tbody.innerHTML = '';
+    bans.sort((a, b) => a.expires.localeCompare(b.expires));
+    bans.forEach((b) => {
+      const tr = document.createElement('tr');
+      const exp = new Date(b.expires).toLocaleString();
+      tr.innerHTML = `<td><code>${esc(b.fingerprint)}</code></td><td>${esc(exp)}</td><td><button data-clear-fp="${esc(b.fingerprint)}">Clear</button></td>`;
+      tbody.appendChild(tr);
+    });
+  }
+
+  async function clearFingerprintBan(fp) {
+    await fetch(`./api/fingerprintbans/clear?fingerprint=${encodeURIComponent(fp)}`, {
+      method: 'POST',
+      headers: { 'X-CSRF-Token': csrfToken },
+    });
+    fetchFingerprintBans();
+  }
+
   // ---------- wiring ----------
   $$('.tab').forEach((t) => t.addEventListener('click', () => {
     $$('.tab').forEach((x) => x.classList.remove('active'));
@@ -268,6 +302,7 @@
     $('#tab-' + t.dataset.tab).classList.add('active');
     if (t.dataset.tab === 'log') fetchLogPage(false);
     if (t.dataset.tab === 'tempbans') fetchTempBans();
+    if (t.dataset.tab === 'fingerprint') fetchFingerprintBans();
   }));
 
   document.body.addEventListener('click', (e) => {
@@ -284,6 +319,9 @@
     }
     else if (e.target.dataset.clearIp) {
       clearTempBan(e.target.dataset.clearIp);
+    }
+    else if (e.target.dataset.clearFp) {
+      clearFingerprintBan(e.target.dataset.clearFp);
     }
     else if (e.target.matches('.row-del')) {
       const table = e.target.closest('table');

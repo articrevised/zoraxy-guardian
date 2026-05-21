@@ -13,21 +13,24 @@ import (
 //
 // Order:
 //
-//  1. Temp ban (set by honeypot or auto-ban escalation)
-//  2. IP blocklist
-//  3. Host-header blocklist
-//  4. Honeypot path match (installs a temp ban as a side-effect)
-//  5. IP allowlist (only enforced on hosts where an allow rule applies)
-//  6. UA blocklist (with optional ExceptPaths)
-//  7. WAF rules
-//  8. Rate limit
+//  1. Fingerprint ban (cross-IP tracking of malicious signatures)
+//  2. Temp ban (set by honeypot or auto-ban escalation)
+//  3. IP blocklist
+//  4. Host-header blocklist
+//  5. Honeypot path match (installs a temp ban as a side-effect)
+//  6. IP allowlist (only enforced on hosts where an allow rule applies)
+//  7. UA blocklist (with optional ExceptPaths)
+//  8. WAF rules
+//  9. Rate limit
 //
 // After any block (other than temp-ban itself, which is already promoted),
-// the IP gets a strike towards auto-ban escalation.
+// the IP gets a strike towards auto-ban escalation, and if fingerprint
+// tracking is enabled, the request fingerprint also gets a strike.
 func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	s.mu.RLock()
 	host := req.Host
 	trust := s.cfg.TrustXFF
+	fpEnabled := s.cfg.FingerprintTracking.Enabled
 	honeypotEnabled := s.cfg.Honeypot.Enabled
 	honeypotBanSecs := s.cfg.Honeypot.BanSeconds
 	allowRules := s.allowRules
@@ -43,12 +46,25 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	ip := clientIP(req, trust)
 	parsedIP := net.ParseIP(ip)
 
-	// 1. Temp ban
+	// Generate fingerprint for cross-IP tracking
+	var fingerprint string
+	if fpEnabled {
+		fingerprint = GenerateFingerprint(req)
+	}
+
+	// 1. Fingerprint ban (check before IP ban to catch IP-hopping attackers)
+	if fpEnabled && fingerprint != "" {
+		if banned, _ := s.IsFingerprintBanned(fingerprint); banned {
+			return Decision{Block: true, Reason: "fingerprint-ban", Status: http.StatusForbidden}
+		}
+	}
+
+	// 2. Temp ban
 	if banned, _ := s.IsTempBanned(ip); banned {
 		return Decision{Block: true, Reason: "temp-ban", Status: http.StatusForbidden}
 	}
 
-	// 2. IP blocklist
+	// 3. IP blocklist
 	if parsedIP != nil {
 		for _, r := range blockRules {
 			if !HostMatches(host, r.Hosts) {
@@ -56,23 +72,29 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 			}
 			if r.Net.Contains(parsedIP) {
 				s.RecordStrike(ip)
+				if fpEnabled && fingerprint != "" {
+					s.RecordFingerprintStrike(fingerprint)
+				}
 				return Decision{Block: true, Reason: "ip-blocklist", Status: http.StatusForbidden}
 			}
 		}
 	}
 
-	// 3. Host-header blocklist
+	// 4. Host-header blocklist
 	for _, r := range hostBlockRules {
 		if !HostMatches(host, r.Hosts) {
 			continue
 		}
 		if r.RE.MatchString(host) {
 			s.RecordStrike(ip)
+			if fpEnabled && fingerprint != "" {
+				s.RecordFingerprintStrike(fingerprint)
+			}
 			return Decision{Block: true, Reason: "host-blocklist", Status: http.StatusForbidden}
 		}
 	}
 
-	// 4. Honeypot path match — install temp ban as a side-effect
+	// 5. Honeypot path match — install temp ban as a side-effect
 	if honeypotEnabled {
 		for _, r := range honeypotRules {
 			if !HostMatches(host, r.Hosts) {
@@ -86,7 +108,7 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 		}
 	}
 
-	// 5. Allowlist (only enforced if at least one allow rule applies to this host)
+	// 6. Allowlist (only enforced if at least one allow rule applies to this host)
 	allowHostScoped := make([]compiledIPRule, 0, len(allowRules))
 	for _, r := range allowRules {
 		if HostMatches(host, r.Hosts) {
@@ -96,6 +118,9 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 	if len(allowHostScoped) > 0 {
 		if parsedIP == nil {
 			s.RecordStrike(ip)
+			if fpEnabled && fingerprint != "" {
+				s.RecordFingerprintStrike(fingerprint)
+			}
 			return Decision{Block: true, Reason: "not-allowlisted", Status: http.StatusForbidden}
 		}
 		allowed := false
@@ -107,11 +132,14 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 		}
 		if !allowed {
 			s.RecordStrike(ip)
+			if fpEnabled && fingerprint != "" {
+				s.RecordFingerprintStrike(fingerprint)
+			}
 			return Decision{Block: true, Reason: "not-allowlisted", Status: http.StatusForbidden}
 		}
 	}
 
-	// 6. UA blocklist (with ExceptPaths)
+	// 7. UA blocklist (with ExceptPaths)
 	ua := firstHeader(req.Header, "User-Agent")
 	for _, r := range uaRules {
 		if !HostMatches(host, r.Hosts) {
@@ -122,20 +150,29 @@ func (s *Store) Evaluate(req *plugin.DynamicSniffForwardRequest) Decision {
 		}
 		if r.RE.MatchString(ua) {
 			s.RecordStrike(ip)
+			if fpEnabled && fingerprint != "" {
+				s.RecordFingerprintStrike(fingerprint)
+			}
 			return Decision{Block: true, Reason: "ua-blocklist", Status: http.StatusForbidden}
 		}
 	}
 
-	// 7. WAF rules
+	// 8. WAF rules
 	if hit := wafCheck(req, host, wafRules, wafNames); hit != "" {
 		s.RecordStrike(ip)
+		if fpEnabled && fingerprint != "" {
+			s.RecordFingerprintStrike(fingerprint)
+		}
 		return Decision{Block: true, Reason: "waf-" + hit, Status: http.StatusForbidden}
 	}
 
-	// 8. Rate limit
+	// 9. Rate limit
 	if limiter != nil && parsedIP != nil {
 		if !limiter.allow(parsedIP.String()) {
 			s.RecordStrike(ip)
+			if fpEnabled && fingerprint != "" {
+				s.RecordFingerprintStrike(fingerprint)
+			}
 			return Decision{Block: true, Reason: "rate-limit", Status: http.StatusTooManyRequests}
 		}
 	}

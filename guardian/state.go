@@ -26,15 +26,16 @@ type ScopedEntry struct {
 }
 
 type Config struct {
-	IPAllowlist   []ScopedEntry `json:"ip_allowlist"`
-	IPBlocklist   []ScopedEntry `json:"ip_blocklist"`
-	UABlocklist   []ScopedEntry `json:"ua_blocklist"`
-	HostBlocklist []ScopedEntry `json:"host_blocklist"`
-	WAFRules      []WAFRule     `json:"waf_rules"`
-	RateLimit     RateLimit     `json:"rate_limit"`
-	Honeypot      Honeypot      `json:"honeypot"`
-	AutoBan       AutoBan       `json:"auto_ban"`
-	TrustXFF      bool          `json:"trust_xff"`
+	IPAllowlist         []ScopedEntry `json:"ip_allowlist"`
+	IPBlocklist         []ScopedEntry `json:"ip_blocklist"`
+	UABlocklist         []ScopedEntry `json:"ua_blocklist"`
+	HostBlocklist       []ScopedEntry `json:"host_blocklist"`
+	WAFRules            []WAFRule     `json:"waf_rules"`
+	RateLimit           RateLimit     `json:"rate_limit"`
+	Honeypot            Honeypot      `json:"honeypot"`
+	AutoBan             AutoBan       `json:"auto_ban"`
+	FingerprintTracking FingerprintTracking `json:"fingerprint_tracking"`
+	TrustXFF            bool          `json:"trust_xff"`
 }
 
 type WAFRule struct {
@@ -70,16 +71,27 @@ type AutoBan struct {
 	BanSeconds    int  `json:"ban_seconds"`
 }
 
+// FingerprintTracking enables tracking and banning request signatures across
+// IP changes. Useful for detecting persistent malicious actors using the same
+// tooling/headers but rotating IPs.
+type FingerprintTracking struct {
+	Enabled       bool `json:"enabled"`
+	Threshold     int  `json:"threshold"`     // Strikes before signature ban
+	WindowSeconds int  `json:"window_seconds"` // Rolling window for strikes
+	BanSeconds    int  `json:"ban_seconds"`    // How long to ban the signature
+}
+
 type BlockLogEntry struct {
-	Time       time.Time `json:"time"`
-	Source     string    `json:"source"` // "guardian" or "zoraxy"
-	IP         string    `json:"ip"`
-	Host       string    `json:"host"`
-	Method     string    `json:"method"`
-	RequestURI string    `json:"request_uri"`
-	UserAgent  string    `json:"user_agent"`
-	Reason     string    `json:"reason"`
-	Status     int       `json:"status"`
+	Time        time.Time `json:"time"`
+	Source      string    `json:"source"` // "guardian" or "zoraxy"
+	IP          string    `json:"ip"`
+	Fingerprint string    `json:"fingerprint,omitempty"` // Request signature hash
+	Host        string    `json:"host"`
+	Method      string    `json:"method"`
+	RequestURI  string    `json:"request_uri"`
+	UserAgent   string    `json:"user_agent"`
+	Reason      string    `json:"reason"`
+	Status      int       `json:"status"`
 }
 
 type compiledIPRule struct {
@@ -127,9 +139,11 @@ type Store struct {
 	pending   map[string]Decision
 
 	// Temporary bans + strike tracking (separate mutex; hot path).
-	banMu    sync.Mutex
-	tempBans map[string]time.Time   // IP -> expiry
-	strikes  map[string][]time.Time // IP -> recent strike timestamps
+	banMu              sync.Mutex
+	tempBans           map[string]time.Time   // IP -> expiry
+	strikes            map[string][]time.Time // IP -> recent strike timestamps
+	fingerprintBans    map[string]time.Time   // Fingerprint -> expiry
+	fingerprintStrikes map[string][]time.Time // Fingerprint -> strike timestamps
 }
 
 type Decision struct {
@@ -140,12 +154,14 @@ type Decision struct {
 
 func LoadState(configPath, logPath string) (*Store, error) {
 	s := &Store{
-		configPath: configPath,
-		logPath:    logPath,
-		pending:    make(map[string]Decision),
-		tempBans:   make(map[string]time.Time),
-		strikes:    make(map[string][]time.Time),
-		bcast:      newBroadcaster(),
+		configPath:         configPath,
+		logPath:            logPath,
+		pending:            make(map[string]Decision),
+		tempBans:           make(map[string]time.Time),
+		strikes:            make(map[string][]time.Time),
+		fingerprintBans:    make(map[string]time.Time),
+		fingerprintStrikes: make(map[string][]time.Time),
+		bcast:              newBroadcaster(),
 	}
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -239,6 +255,16 @@ func mergeDefaults(c Config) Config {
 	}
 	if c.AutoBan.BanSeconds == 0 {
 		c.AutoBan.BanSeconds = 600
+	}
+	// Fingerprint tracking defaults
+	if c.FingerprintTracking.Threshold == 0 {
+		c.FingerprintTracking.Threshold = 10 // Higher than IP auto-ban
+	}
+	if c.FingerprintTracking.WindowSeconds == 0 {
+		c.FingerprintTracking.WindowSeconds = 300 // 5 min window
+	}
+	if c.FingerprintTracking.BanSeconds == 0 {
+		c.FingerprintTracking.BanSeconds = 3600 // 1 hour ban
 	}
 	return c
 }
@@ -438,6 +464,7 @@ func (s *Store) TakeDecision(uuid string) (Decision, bool) {
 func (s *Store) LogBlock(req *plugin.DynamicSniffForwardRequest, d Decision) {
 	s.mu.RLock()
 	trust := s.cfg.TrustXFF
+	fpEnabled := s.cfg.FingerprintTracking.Enabled
 	s.mu.RUnlock()
 
 	entry := BlockLogEntry{
@@ -451,6 +478,12 @@ func (s *Store) LogBlock(req *plugin.DynamicSniffForwardRequest, d Decision) {
 		Reason:     d.Reason,
 		Status:     d.Status,
 	}
+
+	// Add fingerprint if tracking is enabled
+	if fpEnabled {
+		entry.Fingerprint = GenerateFingerprint(req)
+	}
+
 	s.log.Append(entry)
 	s.bcast.publish(entry)
 }
@@ -605,6 +638,111 @@ func (s *Store) banSweepLoop() {
 				delete(s.strikes, ip)
 			}
 		}
+		// Clean fingerprint bans and strikes
+		for fp, exp := range s.fingerprintBans {
+			if now.After(exp) {
+				delete(s.fingerprintBans, fp)
+			}
+		}
+		for fp, hist := range s.fingerprintStrikes {
+			if len(hist) == 0 || now.Sub(hist[len(hist)-1]) > 10*time.Minute {
+				delete(s.fingerprintStrikes, fp)
+			}
+		}
 		s.banMu.Unlock()
 	}
+}
+
+// IsFingerprintBanned checks if a fingerprint is currently temp-banned.
+func (s *Store) IsFingerprintBanned(fp string) (bool, time.Time) {
+	if fp == "" {
+		return false, time.Time{}
+	}
+	s.banMu.Lock()
+	defer s.banMu.Unlock()
+	exp, ok := s.fingerprintBans[fp]
+	if !ok {
+		return false, time.Time{}
+	}
+	if time.Now().After(exp) {
+		delete(s.fingerprintBans, fp)
+		return false, time.Time{}
+	}
+	return true, exp
+}
+
+// AddFingerprintBan installs or extends a temp ban on a fingerprint.
+func (s *Store) AddFingerprintBan(fp string, dur time.Duration) {
+	if fp == "" || dur <= 0 {
+		return
+	}
+	expiry := time.Now().Add(dur)
+	s.banMu.Lock()
+	if cur, ok := s.fingerprintBans[fp]; !ok || cur.Before(expiry) {
+		s.fingerprintBans[fp] = expiry
+	}
+	s.banMu.Unlock()
+}
+
+// RecordFingerprintStrike adds a block strike for a fingerprint signature.
+// If strikes cross the threshold, the fingerprint gets temp-banned.
+func (s *Store) RecordFingerprintStrike(fp string) time.Duration {
+	if fp == "" {
+		return 0
+	}
+	s.mu.RLock()
+	cfg := s.cfg.FingerprintTracking
+	s.mu.RUnlock()
+	if !cfg.Enabled || cfg.Threshold < 1 {
+		return 0
+	}
+	now := time.Now()
+	cutoff := now.Add(-time.Duration(cfg.WindowSeconds) * time.Second)
+
+	s.banMu.Lock()
+	hist := s.fingerprintStrikes[fp]
+	// Drop strikes outside the window
+	keep := hist[:0]
+	for _, t := range hist {
+		if t.After(cutoff) {
+			keep = append(keep, t)
+		}
+	}
+	keep = append(keep, now)
+	s.fingerprintStrikes[fp] = keep
+	count := len(keep)
+	s.banMu.Unlock()
+
+	if count >= cfg.Threshold {
+		dur := time.Duration(cfg.BanSeconds) * time.Second
+		s.AddFingerprintBan(fp, dur)
+		// Reset strikes once promoted
+		s.banMu.Lock()
+		delete(s.fingerprintStrikes, fp)
+		s.banMu.Unlock()
+		return dur
+	}
+	return 0
+}
+
+// FingerprintBansSnapshot returns a copy of the current fingerprint ban map.
+func (s *Store) FingerprintBansSnapshot() map[string]time.Time {
+	s.banMu.Lock()
+	defer s.banMu.Unlock()
+	now := time.Now()
+	out := make(map[string]time.Time, len(s.fingerprintBans))
+	for k, v := range s.fingerprintBans {
+		if v.After(now) {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// ClearFingerprintBan removes an active fingerprint ban.
+func (s *Store) ClearFingerprintBan(fp string) {
+	s.banMu.Lock()
+	delete(s.fingerprintBans, fp)
+	delete(s.fingerprintStrikes, fp)
+	s.banMu.Unlock()
 }

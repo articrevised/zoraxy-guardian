@@ -9,7 +9,7 @@
 <body>
 <header>
   <h1>Guardian</h1>
-  <span class="subtitle">IP &middot; UA &middot; WAF &middot; Rate limit &middot; Honeypot &middot; Auto-ban</span>
+  <span class="subtitle">IP &middot; UA &middot; WAF &middot; Rate limit &middot; Honeypot &middot; Auto-ban &middot; Fingerprint</span>
   <span class="grow"></span>
   <span id="live" class="live" title="live block-log stream status">●</span>
   <button id="theme-toggle" class="icon-btn" title="Toggle dark mode" aria-label="Toggle dark mode">🌓</button>
@@ -23,6 +23,7 @@
   <button class="tab" data-tab="rate">Rate limit</button>
   <button class="tab" data-tab="honeypot">Honeypot</button>
   <button class="tab" data-tab="autoban">Auto-ban</button>
+  <button class="tab" data-tab="fingerprint">Fingerprint</button>
   <button class="tab" data-tab="tempbans">Temp bans</button>
   <button class="tab" data-tab="hostblock">Host block</button>
   <button class="tab" data-tab="import">Import CF</button>
@@ -95,6 +96,21 @@
     <label>Threshold (strikes) <input type="number" id="autoban-threshold" min="1" value="5"></label>
     <label>Window (seconds) <input type="number" id="autoban-window" min="1" value="60"></label>
     <label>Ban duration (seconds) <input type="number" id="autoban-ban-secs" min="60" value="600"></label>
+  </section>
+
+  <section id="tab-fingerprint" class="tab-panel">
+    <h2>Fingerprint tracking</h2>
+    <p class="hint">Track malicious actors across IP changes by fingerprinting User-Agent + Accept headers + HTTP version. When a fingerprint accumulates <code>Threshold</code> strikes within <code>Window</code> seconds, it's banned for <code>Ban duration</code>. Useful for detecting persistent attackers rotating IPs or using distributed scanners with identical tooling.</p>
+    <label><input type="checkbox" id="fingerprint-enabled"> Enabled</label>
+    <label>Threshold (strikes) <input type="number" id="fingerprint-threshold" min="1" value="10"></label>
+    <label>Window (seconds) <input type="number" id="fingerprint-window" min="60" value="300"></label>
+    <label>Ban duration (seconds) <input type="number" id="fingerprint-ban-secs" min="60" value="3600"></label>
+    
+    <h3 style="margin-top:2rem">Banned fingerprints</h3>
+    <table id="fingerprintban-table">
+      <thead><tr><th>Fingerprint</th><th>Expires</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
   </section>
 
   <section id="tab-hostblock" class="tab-panel">

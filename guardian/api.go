@@ -22,6 +22,8 @@ func (a *API) RegisterRoutes(ui *plugin.PluginUiRouter, mux *http.ServeMux) {
 	ui.HandleFunc("/api/blocklog/stream", a.handleBlockLogStream, mux)
 	ui.HandleFunc("/api/tempbans", a.handleTempBans, mux)
 	ui.HandleFunc("/api/tempbans/clear", a.handleTempBansClear, mux)
+	ui.HandleFunc("/api/fingerprintbans", a.handleFingerprintBans, mux)
+	ui.HandleFunc("/api/fingerprintbans/clear", a.handleFingerprintBansClear, mux)
 	ui.HandleFunc("/api/import/cf", a.handleImportCF, mux)
 }
 
@@ -138,6 +140,37 @@ func (a *API) handleTempBansClear(w http.ResponseWriter, r *http.Request) {
 	}
 	a.store.ClearTempBan(ip)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cleared", "ip": ip})
+}
+
+func (a *API) handleFingerprintBans(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	bans := a.store.FingerprintBansSnapshot()
+	type entry struct {
+		Fingerprint string `json:"fingerprint"`
+		Expires     string `json:"expires"`
+	}
+	out := make([]entry, 0, len(bans))
+	for fp, exp := range bans {
+		out = append(out, entry{Fingerprint: fp, Expires: exp.UTC().Format(time.RFC3339)})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *API) handleFingerprintBansClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	fp := r.URL.Query().Get("fingerprint")
+	if fp == "" {
+		http.Error(w, "missing fingerprint query param", http.StatusBadRequest)
+		return
+	}
+	a.store.ClearFingerprintBan(fp)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "cleared", "fingerprint": fp})
 }
 
 // handleImportCF parses a Cloudflare expression and either returns a preview
